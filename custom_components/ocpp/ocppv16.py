@@ -1084,7 +1084,7 @@ class ChargePoint(cp):
         """Handle a boot notification."""
         resp = call_result.BootNotification(
             current_time=datetime.now(tz=UTC).strftime("%Y-%m-%dT%H:%M:%SZ"),
-            interval=3600,
+            interval=300,
             status=RegistrationStatus.accepted.value,
         )
         self.received_boot_notification = True
@@ -1314,7 +1314,7 @@ class ChargePoint(cp):
         charger can do a clean TCP reconnect instead of hitting its firmware
         retry limit and lighting the red LED ring.
         """
-        _TIMEOUT_S = 4800  # ~1.3 × HeartbeatInterval; 80 min gives 50-min margin
+        _TIMEOUT_S = 600  # 2 × HeartbeatInterval (300 s); detects zombie within ~10 min
         while True:
             await asyncio.sleep(60)
             last_hb = self._last_heartbeat_time
