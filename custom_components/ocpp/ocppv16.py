@@ -1047,6 +1047,20 @@ class ChargePoint(cp):
         self.received_boot_notification = True
         _LOGGER.debug("Received boot notification for %s: %s", self.id, kwargs)
 
+        # Per OCPP 1.6 §3.5: BootNotification means the charger has rebooted;
+        # any prior transaction context is invalid. Clear it so the charger can
+        # open a fresh transaction without ID mismatch (Huawei firmware bug
+        # causes the charger to reconnect with a stale/wrong transaction ID).
+        if self._active_tx:
+            _LOGGER.warning(
+                "BootNotification received for %s while transaction(s) %s were active"
+                " — clearing stale transaction state.",
+                self.id,
+                dict(self._active_tx),
+            )
+            self._active_tx.clear()
+            self.active_transaction_id = 0
+
         self.hass.async_create_task(self.async_update_device_info_v16(kwargs))
         self._register_boot_notification()
         return resp
@@ -1126,7 +1140,23 @@ class ChargePoint(cp):
 
         auth_status = self.get_authorization_status(id_tag)
         if auth_status == AuthorizationStatus.accepted.value:
-            tx_id = int(time.time())
+            # Huawei firmware bug: the wallbox ignores the transaction_id we
+            # return and uses its own unix-timestamp ID (the time it sent the
+            # request). We mirror that by parsing the request's timestamp field
+            # so our stored ID matches what the charger will send in MeterValues
+            # and StopTransaction, eliminating the "Unknown transaction" desync.
+            req_timestamp = kwargs.get("timestamp")
+            if req_timestamp:
+                try:
+                    from datetime import datetime, timezone
+                    dt = datetime.fromisoformat(
+                        req_timestamp.replace("Z", "+00:00")
+                    )
+                    tx_id = int(dt.timestamp())
+                except Exception:
+                    tx_id = int(time.time())
+            else:
+                tx_id = int(time.time())
             self._active_tx[connector_id] = tx_id
             self.active_transaction_id = tx_id
             self._metrics[(connector_id, cstat.id_tag.value)].value = id_tag
