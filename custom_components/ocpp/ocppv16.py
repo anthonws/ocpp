@@ -1306,6 +1306,13 @@ class ChargePoint(cp):
         self._metrics[0][cdet.data_transfer.value].extra_attr = {vendor_id: kwargs}
         return call_result.DataTransfer(status=DataTransferStatus.accepted.value)
 
+    async def stop(self) -> None:
+        """Stop charge point, cancelling the heartbeat monitor first."""
+        if self._heartbeat_monitor_task and not self._heartbeat_monitor_task.done():
+            self._heartbeat_monitor_task.cancel()
+            self._heartbeat_monitor_task = None
+        await super().stop()
+
     async def _heartbeat_monitor(self) -> None:
         """Close a zombie WebSocket when heartbeats stop arriving.
 

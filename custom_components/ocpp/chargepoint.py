@@ -562,7 +562,14 @@ class ChargePoint(cp):
         self.status = STATE_UNAVAILABLE
         if self._connection.state is State.OPEN:
             _LOGGER.debug(f"Closing websocket to '{self.id}'")
-            await self._connection.close()
+            try:
+                await asyncio.wait_for(self._connection.close(), timeout=2.0)
+            except Exception:
+                _LOGGER.debug(f"Force-closing stale WebSocket to '{self.id}'")
+                try:
+                    self._connection.transport.close()
+                except Exception:
+                    pass
         for task in self.tasks:
             task.cancel()
 
