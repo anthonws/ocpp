@@ -596,6 +596,37 @@ class ChargePoint(cp):
             conn = 0
 
         typ = AvailabilityType.operative if state else AvailabilityType.inoperative
+
+        # Skip if the connector is already in the desired availability state.
+        # Huawei (and many other chargers) return Rejected when asked to change
+        # to the state they are already in, or when a transaction is in progress.
+        _operative_statuses = {
+            ChargePointStatus.available.value,
+            ChargePointStatus.preparing.value,
+            ChargePointStatus.charging.value,
+            ChargePointStatus.suspended_evse.value,
+            ChargePointStatus.suspended_ev.value,
+            ChargePointStatus.finishing.value,
+            ChargePointStatus.reserved.value,
+        }
+        try:
+            current = self._metrics.get((conn if conn > 0 else 1, cstat.status_connector.value))
+            current_status = getattr(current, "value", None) if current else None
+            if state and current_status in _operative_statuses:
+                _LOGGER.debug(
+                    "set_availability: connector %s already operative (%s), skipping ChangeAvailability.",
+                    conn, current_status,
+                )
+                return True
+            if not state and current_status == ChargePointStatus.unavailable.value:
+                _LOGGER.debug(
+                    "set_availability: connector %s already unavailable, skipping ChangeAvailability.",
+                    conn,
+                )
+                return True
+        except Exception:
+            pass
+
         req = call.ChangeAvailability(connector_id=conn, type=typ)
 
         try:
