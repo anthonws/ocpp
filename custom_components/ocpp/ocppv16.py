@@ -1111,6 +1111,7 @@ class ChargePoint(cp):
             self._heartbeat_monitor(),
             name=f"ocpp_heartbeat_monitor_{self.id}",
         )
+        self.hass.async_create_task(self._configure_connection_timeout())
 
         self.hass.async_create_task(self.async_update_device_info_v16(kwargs))
         self._register_boot_notification()
@@ -1345,6 +1346,10 @@ class ChargePoint(cp):
                         exc,
                     )
                 break
+
+    async def _configure_connection_timeout(self) -> None:
+        # Huawei default ~120 s < typical AP restart time; 600 s gives a 10-min window.
+        await self.configure("ConnectionTimeOut", "600")
 
     @on(Action.heartbeat)
     def on_heartbeat(self, **kwargs):
