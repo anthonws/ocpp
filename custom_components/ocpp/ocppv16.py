@@ -333,7 +333,9 @@ class ChargePoint(cp):
             return True
         else:
             self.triggered_boot_notification = False
-            _LOGGER.warning("Failed with response: %s", resp.status)
+            # Downgraded to debug: many chargers (e.g. Huawei) do not support
+            # TriggerMessage and will always Reject it. This is harmless.
+            _LOGGER.debug("TriggerMessage(BootNotification) not accepted: %s", resp.status)
             return False
 
     async def trigger_status_notification(self):
@@ -361,7 +363,14 @@ class ChargePoint(cp):
 
             if status != TriggerMessageStatus.accepted:
                 if cid > 0:
-                    _LOGGER.warning("Failed with response: %s", status)
+                    # Downgraded to debug: Huawei and other chargers routinely
+                    # reject TriggerMessage — it is optional in OCPP 1.6 and
+                    # its failure does not affect charging or session tracking.
+                    _LOGGER.debug(
+                        "TriggerMessage(StatusNotification) rejected on connector %s: %s"
+                        " (charger may not support TriggerMessage)",
+                        cid, status,
+                    )
                     # Reduce to the last known-good connector index.
                     self._metrics[0][cdet.connectors.value].value = max(1, cid - 1)
                     return False
