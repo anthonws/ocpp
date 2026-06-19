@@ -3,6 +3,7 @@
 from datetime import datetime, timedelta, UTC
 import logging
 
+import asyncio
 import time
 
 from homeassistant.config_entries import ConfigEntry
@@ -102,6 +103,8 @@ class ChargePoint(cp):
             charger,
         )
         self._active_tx: dict[int, int] = {}  # connector_id -> transaction_id
+        self._heartbeat_monitor_task: asyncio.Task | None = None
+        self._last_heartbeat_time: datetime | None = None  # Fix 6: tracked directly
 
     async def get_number_of_connectors(self) -> int:
         """Return number of connectors on this charger."""
@@ -1047,6 +1050,20 @@ class ChargePoint(cp):
         self.received_boot_notification = True
         _LOGGER.debug("Received boot notification for %s: %s", self.id, kwargs)
 
+        # Fix 6: seed our own heartbeat tracker so the monitor counts from this
+        # fresh connection, not from the last heartbeat before the outage.
+        self._last_heartbeat_time = datetime.now(tz=UTC)
+
+        # Fix 6: (re)start the heartbeat-gap monitor for this connection.
+        # Use async_create_background_task so HA's startup tracker doesn't wait
+        # on (or cancel) this long-running loop during bootstrap.
+        if self._heartbeat_monitor_task and not self._heartbeat_monitor_task.done():
+            self._heartbeat_monitor_task.cancel()
+        self._heartbeat_monitor_task = self.hass.async_create_background_task(
+            self._heartbeat_monitor(),
+            name=f"ocpp_heartbeat_monitor_{self.id}",
+        )
+
         self.hass.async_create_task(self.async_update_device_info_v16(kwargs))
         self._register_boot_notification()
         return resp
@@ -1225,10 +1242,55 @@ class ChargePoint(cp):
         self._metrics[0][cdet.data_transfer.value].extra_attr = {vendor_id: kwargs}
         return call_result.DataTransfer(status=DataTransferStatus.accepted.value)
 
+    async def _heartbeat_monitor(self) -> None:
+        """Close the WebSocket when heartbeats stop — Fix 6: zombie-state recovery.
+
+        After a network outage the Huawei Wallbox sometimes keeps the TCP
+        connection alive while the OCPP application layer freezes (heartbeats
+        stop). HA never detects this because the socket looks healthy. This task
+        closes the socket after 2 × HeartbeatInterval (7200 s), forcing a clean
+        WebSocket reconnect before the wallbox exhausts its firmware retry budget
+        and shows a red LED ring.
+
+        Observed zombie windows before red ring: 219 min (Jun 15), 593 min
+        (Jun 17), 447 min (Jun 19) — all above the 120 min threshold.
+        """
+        _TIMEOUT_S = 4800  # ~1.3 × HeartbeatInterval (3600 s); fires ~80 min after last heartbeat.
+        # Jun 15/17/19 incidents showed wallbox becomes unrecoverable at ~130 min,
+        # so 80 min gives a 50-min safety margin before the point of no return.
+
+        while True:
+            await asyncio.sleep(60)  # check every minute; negligible overhead
+
+            last_hb = self._last_heartbeat_time
+            if last_hb is None:
+                continue
+
+            gap = (datetime.now(tz=UTC) - last_hb).total_seconds()
+
+            if gap > _TIMEOUT_S:
+                _LOGGER.warning(
+                    "%s: no heartbeat for %.0f s (threshold %d s) — "
+                    "closing stale WebSocket to force clean reconnect.",
+                    self.id,
+                    gap,
+                    _TIMEOUT_S,
+                )
+                try:
+                    await self._connection.close()
+                except Exception as exc:
+                    _LOGGER.debug(
+                        "%s: error closing WebSocket in heartbeat-timeout recovery: %s",
+                        self.id,
+                        exc,
+                    )
+                break  # task ends; a new one starts on next BootNotification
+
     @on(Action.heartbeat)
     def on_heartbeat(self, **kwargs):
         """Handle a Heartbeat."""
         now = datetime.now(tz=UTC)
         self._metrics[0][cstat.heartbeat.value].value = now
+        self._last_heartbeat_time = now  # Fix 6: keep our own tracker in sync
         self.hass.async_create_task(self.update(self.settings.cpid))
         return call_result.Heartbeat(current_time=now.strftime("%Y-%m-%dT%H:%M:%SZ"))
