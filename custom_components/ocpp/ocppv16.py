@@ -1,5 +1,6 @@
 """Representation of a OCPP 1.6 charging station."""
 
+import asyncio
 from datetime import datetime, timedelta, UTC
 import logging
 
@@ -102,6 +103,8 @@ class ChargePoint(cp):
             charger,
         )
         self._active_tx: dict[int, int] = {}  # connector_id -> transaction_id
+        self._last_heartbeat_time: datetime | None = None
+        self._heartbeat_monitor_task: asyncio.Task | None = None
 
     async def get_number_of_connectors(self) -> int:
         """Return number of connectors on this charger."""
@@ -1101,6 +1104,14 @@ class ChargePoint(cp):
             self._active_tx.clear()
             self.active_transaction_id = 0
 
+        self._last_heartbeat_time = datetime.now(tz=UTC)
+        if self._heartbeat_monitor_task and not self._heartbeat_monitor_task.done():
+            self._heartbeat_monitor_task.cancel()
+        self._heartbeat_monitor_task = self.hass.async_create_background_task(
+            self._heartbeat_monitor(),
+            name=f"ocpp_heartbeat_monitor_{self.id}",
+        )
+
         self.hass.async_create_task(self.async_update_device_info_v16(kwargs))
         self._register_boot_notification()
         return resp
@@ -1295,10 +1306,44 @@ class ChargePoint(cp):
         self._metrics[0][cdet.data_transfer.value].extra_attr = {vendor_id: kwargs}
         return call_result.DataTransfer(status=DataTransferStatus.accepted.value)
 
+    async def _heartbeat_monitor(self) -> None:
+        """Close a zombie WebSocket when heartbeats stop arriving.
+
+        Runs as a background task (survives HA bootstrap). Sleeps 60 s between
+        checks; closes the connection once the gap exceeds _TIMEOUT_S so the
+        charger can do a clean TCP reconnect instead of hitting its firmware
+        retry limit and lighting the red LED ring.
+        """
+        _TIMEOUT_S = 4800  # ~1.3 × HeartbeatInterval; 80 min gives 50-min margin
+        while True:
+            await asyncio.sleep(60)
+            last_hb = self._last_heartbeat_time
+            if last_hb is None:
+                continue
+            gap = (datetime.now(tz=UTC) - last_hb).total_seconds()
+            if gap > _TIMEOUT_S:
+                _LOGGER.warning(
+                    "%s: no heartbeat for %.0f s (threshold %d s) — "
+                    "closing stale WebSocket to force clean reconnect.",
+                    self.id,
+                    gap,
+                    _TIMEOUT_S,
+                )
+                try:
+                    await self._connection.close()
+                except Exception as exc:
+                    _LOGGER.debug(
+                        "%s: error closing WebSocket in heartbeat-timeout recovery: %s",
+                        self.id,
+                        exc,
+                    )
+                break
+
     @on(Action.heartbeat)
     def on_heartbeat(self, **kwargs):
         """Handle a Heartbeat."""
         now = datetime.now(tz=UTC)
         self._metrics[0][cstat.heartbeat.value].value = now
+        self._last_heartbeat_time = now
         self.hass.async_create_task(self.update(self.settings.cpid))
         return call_result.Heartbeat(current_time=now.strftime("%Y-%m-%dT%H:%M:%SZ"))
