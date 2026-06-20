@@ -81,6 +81,23 @@ After a Wi-Fi blip the FSM parks here waiting for a connect-signal that, in prac
 
 On a *clean* disconnect, `OcppLinkMgr::ProcLinkStateChange` (`0x148908`) → `ReportLinkStatus` (`0x14900c`) → `ReportLinkStatusToNetworkMgr` (`0x149194`) reports link-down to `app_arm` **synchronously, with no debounce**, and `app_arm` raises the "Failed to Communicate with OCPP System" alarm / fault ring. (The alarm/LED decision itself lives in `app_arm`, which is stripped and not analysed in depth.)
 
+## Call graph — disconnect & reconnect paths
+
+```mermaid
+flowchart TD
+    EV["OcppEventCallBack @0x1477e8 — lws events"] --> PSC["ProcLinkStateChange @0x148908"]
+    PSC --> RLS["ReportLinkStatus @0x14900c"] --> RLN["ReportLinkStatusToNetworkMgr @0x149194"] --> APP["app_arm — registration / alarm / LED ring"]
+    TMR["ProcLinkMgrTimerEvent @0x148fe4 — periodic tick"] --> FSM["ProcLinkFsm @0x149dd0 — switch on stored status"]
+    TMR --> DIS["ProcDisconnLinkEvent @0x14959c — retry counters"] --> SLR["SendLinkRestartToNetManager → app_arm"]
+    APP -->|"connect-signal (cold boot only)"| CSN["ProcConnSigNotifyMsg @0x147fe0"] --> RC["RestartConnect"] --> PSC
+    subgraph GAP["Missing liveness — the defect"]
+        SPI["SetPingInterval @0x14a090 — stores value, never arms an lws ping"]
+        HB["HeartBeatProtocolCmd::Request @0x12a680 — fire-and-forget, no ack timeout"]
+    end
+```
+
+Everything that could detect a dead link (the boxes in *Missing liveness*) is never wired into recovery, and the only path back to a live session (`ProcConnSigNotifyMsg → RestartConnect`) depends on a connect-signal from `app_arm` that, in practice, only fires on a cold boot. Hence: park until power-cycle.
+
 ## Code signing (why you cannot just reflash)
 
 Every component is integrity-protected and the device enforces it:
@@ -90,6 +107,17 @@ Every component is integrity-protected and the device enforces it:
 - `config.txt` sets `SecureBoot=1`.
 
 So modifying any byte breaks the SHA-256 → CMS verification fails → the component is rejected. A working patch would require Huawei's private key. This is why all workarounds here are **CSMS-side**, never on-device.
+
+## Methodology
+
+1. **Unpack** the OTA package with `tar`/`xz` (no binwalk needed — it is nested tarballs).
+2. **Locate the OCPP client** by `strings` (`BootNotification`, `wss://`, `OcppLinkMgr`, libwebsockets symbols).
+3. **Get addresses** from the dynamic symbol table: `objdump -T ocpp_plugin`. The `.symtab` is stripped but `.dynsym` exports the C++ methods.
+4. **Force Thumb** — mapping symbols (`$a/$t`) were stripped, so set `asm.bits=16` (radare2) / `--triple=thumbv7` (LLVM objdump); otherwise it decodes as ARM and yields garbage.
+5. **Decompile** target functions (`pdc` in radare2) and cross-reference the libwebsockets imports.
+6. **Confirm signing** with `openssl cms -inform DER -in <component>_filelist.cms -cmsout -print`.
+
+All read-only: no code executed, no firmware modified, nothing reflashed.
 
 ## Conclusion
 

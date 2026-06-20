@@ -36,9 +36,9 @@ When the charger loses its network path mid-session:
 
 ```mermaid
 sequenceDiagram
-    participant CP as Charger (OCPP client)
+    participant CP as Charger
     participant AP as Wi-Fi AP
-    participant CSMS as Home Assistant (CSMS)
+    participant CSMS as Home Assistant CSMS
     CP->>CSMS: BootNotification, then Heartbeat every 60s
     Note over CP,CSMS: Normal operation
     AP-->>AP: AP reboots (e.g. nightly update)
