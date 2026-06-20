@@ -1084,7 +1084,11 @@ class ChargePoint(cp):
         """Handle a boot notification."""
         resp = call_result.BootNotification(
             current_time=datetime.now(tz=UTC).strftime("%Y-%m-%dT%H:%M:%SZ"),
-            interval=300,
+            # Heartbeat interval paces wake-up after an AP restart: once HA has
+            # closed the zombie socket, the charger's NEXT heartbeat into the dead
+            # socket hits HA's kernel RST, which is what unfreezes the firmware's
+            # link FSM. 60 s → wake within ~1 min of the AP returning (vs ~5 min at 300).
+            interval=60,
             status=RegistrationStatus.accepted.value,
         )
         self.received_boot_notification = True
@@ -1317,14 +1321,19 @@ class ChargePoint(cp):
     async def _heartbeat_monitor(self) -> None:
         """Close a zombie WebSocket when heartbeats stop arriving.
 
-        Runs as a background task (survives HA bootstrap). Sleeps 60 s between
+        Runs as a background task (survives HA bootstrap). Sleeps 30 s between
         checks; closes the connection once the gap exceeds _TIMEOUT_S so the
         charger can do a clean TCP reconnect instead of hitting its firmware
         retry limit and lighting the red LED ring.
+
+        This is the backstop for the case the WS-ping monitor (monitor_connection)
+        misses: the charger's libwebsockets auto-PONGs HA's pings at the protocol
+        layer even while the OCPP app is frozen, so a missing OCPP heartbeat is the
+        only reliable signal that the application-level link is actually dead.
         """
-        _TIMEOUT_S = 600  # 2 × HeartbeatInterval (300 s); detects zombie within ~10 min
+        _TIMEOUT_S = 180  # 3 × HeartbeatInterval (60 s); catches an app-frozen zombie in ~3 min
         while True:
-            await asyncio.sleep(60)
+            await asyncio.sleep(30)
             last_hb = self._last_heartbeat_time
             if last_hb is None:
                 continue
@@ -1338,13 +1347,19 @@ class ChargePoint(cp):
                     _TIMEOUT_S,
                 )
                 try:
-                    await self._connection.close()
-                except Exception as exc:
-                    _LOGGER.debug(
-                        "%s: error closing WebSocket in heartbeat-timeout recovery: %s",
-                        self.id,
-                        exc,
-                    )
+                    await asyncio.wait_for(self._connection.close(), timeout=2.0)
+                except Exception:
+                    # Dead path: the close handshake can't complete. Force-close the
+                    # transport so HA's kernel will RST the charger's next heartbeat —
+                    # that RST is what wakes the firmware's frozen link FSM.
+                    try:
+                        self._connection.transport.close()
+                    except Exception as exc:
+                        _LOGGER.debug(
+                            "%s: error force-closing WebSocket in zombie recovery: %s",
+                            self.id,
+                            exc,
+                        )
                 break
 
     async def _configure_connection_timeout(self) -> None:
